@@ -224,6 +224,7 @@ histdb-sync () {
 
             pushd -q "$hist_dir"
             if [[ $(git rev-parse --is-inside-work-tree) != "true" ]] || [[ "$(git rev-parse --show-toplevel)" != "${PWD:A}" ]]; then
+                echo "Initializing git repository"
                 git init
                 git config merge.histdb.driver "${HISTDB_INSTALLED_IN:h}/histdb-merge %O %A %B"
                 echo "${HISTDB_FILE:t} merge=histdb" >>! .gitattributes
@@ -231,7 +232,7 @@ histdb-sync () {
                 git add "${HISTDB_FILE:t}"
             fi
             _histdb_stop_sqlite_pipe # Stop in case of a merge, starting again afterwards
-            git commit -am "history" && git pull --no-edit && git push
+            git commit -am "history" && git pull --rebase && git push
             _histdb_start_sqlite_pipe
             popd -q
         }
