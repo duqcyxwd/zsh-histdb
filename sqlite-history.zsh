@@ -47,7 +47,6 @@ _histdb_stop_sqlite_pipe () {
     # fi
 }
 
-add-zsh-hook zshexit _histdb_stop_sqlite_pipe
 
 _histdb_start_sqlite_pipe () {
     local PIPE==(<<<'')
@@ -180,8 +179,6 @@ EOF
     return 0
 }
 
-add-zsh-hook zshaddhistory _histdb_addhistory
-add-zsh-hook precmd _histdb_update_outcome
 
 histdb-top () {
     _histdb_init
@@ -502,3 +499,15 @@ where ${where})"
         fi
     fi
 }
+
+
+
+# Default HISTDB_HOOK to 1 if not set in environment
+: ${HISTDB_HOOK:=0}
+
+if [[ "$HISTDB_HOOK" -eq 1 ]]; then
+  add-zsh-hook zshexit _histdb_stop_sqlite_pipe
+  add-zsh-hook zshaddhistory _histdb_addhistory
+  add-zsh-hook precmd _histdb_update_outcome
+fi
+
