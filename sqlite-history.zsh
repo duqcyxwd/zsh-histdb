@@ -23,7 +23,7 @@ typeset -g HISTDB_INSTALLED_IN="${(%):-%N}"
 
 
 sql_escape () {
-    print -r -- ${${@//\'/\'\'}//$'\x00'}
+    print -r -- ${${@//\'/\'\'}//'\x00'}
 }
 
 _histdb_query () {
@@ -213,7 +213,7 @@ histdb-sync () {
     # this ought to apply to other readers?
     echo "truncating WAL"
     echo 'pragma wal_checkpoint(truncate);' | _histdb_query_batch
-    
+
     local hist_dir="${HISTDB_FILE:h}"
     if [[ -d "$hist_dir" ]]; then
         () {
@@ -221,21 +221,106 @@ histdb-sync () {
 
             pushd -q "$hist_dir"
             if [[ $(git rev-parse --is-inside-work-tree) != "true" ]] || [[ "$(git rev-parse --show-toplevel)" != "${PWD:A}" ]]; then
+
                 echo "Initializing git repository"
                 git init
+
+                echo "git config merge.histdb.driver ${HISTDB_INSTALLED_IN:h}/histdb-merge %O %A %B"
                 git config merge.histdb.driver "${HISTDB_INSTALLED_IN:h}/histdb-merge %O %A %B"
+
                 echo "${HISTDB_FILE:t} merge=histdb" >>! .gitattributes
+
                 git add .gitattributes
                 git add "${HISTDB_FILE:t}"
+
             fi
+
+            echo "Close sqlite pipe _histdb_stop_sqlite_pipe"
             _histdb_stop_sqlite_pipe # Stop in case of a merge, starting again afterwards
-            git commit -am "history" && git pull --rebase && git push
+
+            echo "git commit -am history && git pull --no-edit && git push"
+            git commit -am "history" && git pull --no-edit && git push
+
+            echo "Start sqlite pipe"
             _histdb_start_sqlite_pipe
             popd -q
         }
     fi
 
     echo 'pragma wal_checkpoint(passive);' | _histdb_query_batch
+}
+
+histdb-git-compact () {
+  # Accept commit hash as parameter or use default
+  # This function creates a new Git history starting from the specified commit
+  # It preserves all changes but discards the history before that point
+  local commit_hash="${1}"
+
+  # Validate the commit hash exists
+  if ! git rev-parse --verify "$commit_hash" &>/dev/null; then
+    echo "Error: Commit hash '$commit_hash' does not exist in the repository."
+    echo "Usage: histdb_git_clean [commit_hash]"
+    return 1
+  fi
+
+  echo "Using commit hash: $commit_hash"
+
+  git config merge.histdb.driver "${HISTDB_INSTALLED_IN:h}/histdb-merge %O %A %B"
+
+  # New steps
+  git checkout --orphan new-master "$commit_hash"
+  git commit -m "Start new history"
+
+  # Cherry-pick commits from the specified commit to master
+  git cherry-pick --allow-empty --keep-redundant-commits -m 1 "$commit_hash"..master
+
+}
+
+histdb-git-clean() {
+  # This function finalizes the Git history cleanup process
+  # It removes the old master branch, renames the current branch to master,
+  # cleans up references, and force pushes the new history
+
+  git branch -D master
+  git branch -m master
+
+  # Force clean old Git history references
+  git reflog expire --expire=now --all
+  git gc --prune=now --aggressive
+
+  git push -f origin master
+
+}
+
+
+histdb-summary() {
+    _histdb_init
+
+    local total_count=$(_histdb_query "SELECT COUNT(*) FROM history")
+    local today_count=$(_histdb_query "SELECT COUNT(*) FROM history WHERE datetime(start_time, 'unixepoch') >= datetime('now', 'start of day')")
+    local yesterday_count=$(_histdb_query "SELECT COUNT(*) FROM history WHERE datetime(start_time, 'unixepoch') >= datetime('now', 'start of day', '-1 day') AND datetime(start_time, 'unixepoch') < datetime('now', 'start of day')")
+    local week_count=$(_histdb_query "SELECT COUNT(*) FROM history WHERE datetime(start_time, 'unixepoch') >= datetime('now', '-7 days')")
+    local unique_cmds=$(_histdb_query "SELECT COUNT(DISTINCT command_id) FROM history")
+    local unique_dirs=$(_histdb_query "SELECT COUNT(DISTINCT place_id) FROM history")
+    local error_count=$(_histdb_query "SELECT COUNT(*) FROM history WHERE exit_status != 0")
+    local most_used=$(_histdb_query "SELECT commands.argv, COUNT(*) as count FROM history JOIN commands ON history.command_id = commands.id GROUP BY commands.argv ORDER BY count DESC LIMIT 1")
+    local most_used_cmd=$(echo "$most_used" | cut -d'|' -f1)
+    local most_used_count=$(echo "$most_used" | cut -d'|' -f2)
+    local avg_duration=$(_histdb_query "SELECT ROUND(AVG(duration), 2) FROM history WHERE duration IS NOT NULL")
+
+    echo "┌─────────────────────────────────────────────┐"
+    echo "│             HISTORY DB SUMMARY              │"
+    echo "├─────────────────────────────────────────────┤"
+    echo "│ Total commands:       $total_count"
+    echo "│ Commands today:       $today_count"
+    echo "│ Commands yesterday:   $yesterday_count"
+    echo "│ Commands this week:   $week_count"
+    echo "│ Unique commands:      $unique_cmds"
+    echo "│ Unique directories:   $unique_dirs"
+    echo "│ Commands with errors: $error_count"
+    echo "│ Most used command:    $most_used_cmd ($most_used_count times)"
+    echo "│ Average duration:     ${avg_duration}s"
+    echo "└─────────────────────────────────────────────┘"
 }
 
 histdb () {
@@ -420,7 +505,13 @@ histdb () {
     if [[ $forget -gt 0 ]]; then
         limit=""
     fi
-    local seps=$(echo "$cols" | tr -c -d ',' | tr ',' $sep)
+
+    # Fix: Handle separator properly
+    local seps=""
+    if [[ -n "$sep" ]]; then
+        seps=$(echo "$cols" | tr -c -d ',' | tr ',' "$sep")
+    fi
+
     cols="${cols}, replace(commands.argv, '
 ', '
 $seps') as argv, max(start_time) as max_start"
@@ -473,11 +564,14 @@ order by max_start desc) order by max_start ${orderdir}"
                 cat
             }
         fi
-        if [[ $sep == $'\x1f' ]]; then
-            _histdb_query -header -separator $sep "$query" | iconv -f utf-8 -t utf-8 -c | buffer | "${HISTDB_TABULATE_CMD[@]}"
+
+        # Fix: Properly handle separator for query
+        if [[ "$sep" == $'\x1f' ]]; then
+            _histdb_query -header -separator "$sep" "$query" | iconv -f utf-8 -t utf-8 -c | buffer | "${HISTDB_TABULATE_CMD[@]}"
         else
-            _histdb_query -header -separator $sep "$query" | buffer
+            _histdb_query -header -separator "${sep:-' '}" "$query" | buffer
         fi
+
         [[ -n $limit ]] && [[ $limit -lt $count ]] && echo "(showing $limit of $count results)"
     fi
 
@@ -500,14 +594,11 @@ where ${where})"
     fi
 }
 
-
-
 # Default HISTDB_HOOK to 1 if not set in environment
-: ${HISTDB_HOOK:=0}
+: ${HISTDB_HOOK:=1}
 
 if [[ "$HISTDB_HOOK" -eq 1 ]]; then
   add-zsh-hook zshexit _histdb_stop_sqlite_pipe
   add-zsh-hook zshaddhistory _histdb_addhistory
   add-zsh-hook precmd _histdb_update_outcome
 fi
-
